@@ -1,0 +1,12 @@
+{
+  "promo_code": "set-in-github-secrets",
+  "email_to": "set-in-github-secrets",
+
+  "max_price": 100,
+  "adults": 2,
+  "months_ahead": 2,
+  "regions": ["europe", "middle-east"],
+
+  "sweep_interval_min": 2,
+  "delay_between_requests_s": 0.3
+}
