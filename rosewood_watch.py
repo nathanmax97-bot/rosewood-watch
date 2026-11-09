@@ -1,13 +1,16 @@
 """Rosewood promo-rate watcher (no browser needed).
 
 Reads the same rate-calendar data the booking page uses, with your promo code
-applied, for every bookable hotel in your chosen regions. Emails you the first
-time any date shows a rate at or below max_price.
+applied, for every bookable hotel in your chosen regions. Emails you whenever a
+date shows a rate at or below max_price that was not there on the previous sweep
+(so a date that disappears and comes back, e.g. a cancellation, alerts again).
+Each alert links straight to that hotel and date with your code already applied.
+If the site rejects your promo code on every request, you get one warning email.
 
-Setup:   pip install requests
+Setup:   pip3 install requests
 Email:   set SMTP_USER and SMTP_PASS (Gmail app password) as environment variables
-Run:     python rosewood_watch.py --once     one sweep, prints what it found
-         python rosewood_watch.py            sweep forever
+Run:     python3 rosewood_watch.py --once     one sweep, prints what it found
+         python3 rosewood_watch.py            sweep forever
 """
 import json, os, smtplib, sys, time
 from datetime import date, timedelta
@@ -16,9 +19,13 @@ from urllib.parse import quote
 import requests
 
 CFG = json.load(open("config.json"))
+for _env, _key in (("PROMO_CODE", "promo_code"), ("EMAIL_TO", "email_to")):
+    if os.environ.get(_env):
+        CFG[_key] = os.environ[_env]  # lets GitHub secrets override the config file
 BASE = "https://www.rosewoodhotels.com"
 HOTEL_LIST = BASE + "/content/dam/rosewoodhotels/json/brand/hotels/en/rosewood-hotel.json"
 SEEN_FILE = "seen.json"
+CODE_FLAG = "__code_rejected__"
 HEADERS = {"User-Agent": "rosewood-watch/1.0 (personal use)", "Accept": "application/json"}
 
 
@@ -78,14 +85,15 @@ def fetch_month(session, hotel, start, end, promo):
 
 
 def find_hits(payload, max_price):
-    """Return [(date, amount_eur)] for available dates at or below max_price."""
+    """Return [(date, amount, currency_symbol, min_stay, room_code)] at or below max_price."""
     hits = []
     for hotel in payload.get("hotels", []):
         for day in hotel.get("availability", []):
             rate = day.get("rate") or {}
             amount = rate.get("amount")
             if day.get("available") and amount is not None and amount <= max_price:
-                hits.append((day["date"], amount))
+                hits.append((day["date"], amount, rate.get("currencySymbol") or rate.get("currency", ""),
+                             day.get("minStay", "1"), day.get("roomCode", "")))
     return hits
 
 
@@ -93,42 +101,78 @@ def code_rejected(payload):
     return any(w.get("Code") == "InvalidPromoOrCorporateCode" for w in payload.get("warning", []))
 
 
-def sweep(session, seen):
-    found, rejected_seen = [], False
+def booking_link(hotel_code, check_in, min_stay):
+    """Link to the hotel's room page for that date with the promo code already applied."""
+    try:
+        nights = max(1, int(min_stay))
+    except (TypeError, ValueError):
+        nights = 1
+    check_out = date.fromisoformat(check_in) + timedelta(days=nights)
+    return (
+        f"{BASE}/en/{hotel_code}/reservations/room-availability?hotelId={quote(hotel_code)}"
+        f"&promoCode={quote(CFG['promo_code'])}&checkInDate={check_in}&checkOutDate={check_out}"
+        f"&numRooms=1&adults={CFG['adults']}&childrenCountPerRoom=0&adultsPerRoom={CFG['adults']}"
+    )
+
+
+def sweep(session, previous):
+    """Returns (current_keys, new_lines, code_problem). A key is 'hotel|date'.
+
+    If a request fails, that hotel/month keeps its previous keys, so a network
+    blip does not cause a false 'new' alert on the next sweep.
+    code_problem is True when the site rejected the promo code on every request.
+    """
+    current, lines = set(), []
+    ok = rejected = 0
     for hotel in get_hotels(session):
         for start, end in month_windows(CFG["months_ahead"]):
+            month = str(start)[:7]
             try:
                 payload = fetch_month(session, hotel, start, end, CFG["promo_code"])
             except Exception as e:
-                print(f"skip {hotel['name'].strip()} {start}: {e}")
+                print(f"skip {hotel['name'].strip()} {month}: {str(e)[:60]}")
+                current |= {k for k in previous if k.startswith(f"{hotel['code']}|{month}")}
                 continue
-            if code_rejected(payload) and not rejected_seen:
-                print("NOTE: the site reports your promo code as invalid or without rates right now.")
-                rejected_seen = True
-            for d, amount in find_hits(payload, CFG["max_price"]):
+            ok += 1
+            if code_rejected(payload):
+                rejected += 1
+            for d, amount, cur, min_stay, room in find_hits(payload, CFG["max_price"]):
                 key = f"{hotel['code']}|{d}"
-                if key in seen:
-                    continue
-                seen.add(key)
-                link = f"{BASE}/en/{hotel['code']}/reservations/room-booking"
-                found.append(f"{hotel['name'].strip()}  {d}  EUR {amount:.2f}\n{link}")
+                current.add(key)
+                if key not in previous:
+                    stay = f", min stay {min_stay} nights" if str(min_stay) not in ("1", "") else ""
+                    lines.append(f"{hotel['name'].strip()}  {d}  {cur}{amount:.2f}  (room {room}{stay})\n"
+                                 f"{booking_link(hotel['code'], d, min_stay)}")
             time.sleep(CFG["delay_between_requests_s"])
-    return found
+    code_problem = ok > 0 and rejected == ok
+    if code_problem:
+        print("NOTE: the site rejected the promo code on every request.")
+    return current, lines, code_problem
 
 
 def main():
     once = "--once" in sys.argv
     session = requests.Session()
     session.headers.update(HEADERS)
-    seen = load_seen()
+    previous = load_seen()
     while True:
         print(time.strftime("%H:%M:%S"), "sweep start")
-        found = sweep(session, seen)
-        save_seen(seen)
-        print(f"{len(found)} new hit(s)")
-        if found:
-            send_email(f"Rosewood: {len(found)} promo rate(s) found", "\n\n".join(found))
+        current, lines, code_problem = sweep(session, previous)
+        print(f"{len(lines)} new hit(s), {len(current)} available in total")
+        # Email first: if sending fails, results are not saved and the next run tries again.
+        if code_problem and CODE_FLAG not in previous:
+            send_email("Rosewood: your promo code is being rejected",
+                       "The site rejected your promo code on every request. It has probably expired "
+                       "or changed. Update the PROMO_CODE secret in GitHub (Settings > Secrets and "
+                       "variables > Actions). You will not get alerts until it is fixed.")
+            print("emailed code warning")
+        if code_problem:
+            current.add(CODE_FLAG)
+        if lines:
+            send_email(f"Rosewood: {len(lines)} new promo rate(s)", "\n\n".join(lines))
             print("emailed")
+        save_seen(current)
+        previous = current
         if once:
             break
         time.sleep(CFG["sweep_interval_min"] * 60)
