@@ -1,2 +1,0 @@
-# rosewood-watch
-website scanner
